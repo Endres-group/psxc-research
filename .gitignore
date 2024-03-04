@@ -1,0 +1,34 @@
+# Ignore python files
+*.pyc
+__pycache__/
+*.egg-info/
+
+# Ignore virtual environment files
+venv/
+
+# Ignote ctags
+tags
+
+# Ignore .DS_Store
+.DS_Store
+
+# Ignore jupyterlab related files
+.virtual_documents
+**/*.ipynb_checkpoints/
+
+# Ignore output files
+**/*.pdf
+**/*.png
+**/*.jpg
+**/*.npz
+**/*.npy
+**/*.mp4
+**/*.mov
+**/*.pkl
+
+# Project specific files
+**/.backup**
+**/runs**
+scripts/data/
+scripts/figures/
+docs/

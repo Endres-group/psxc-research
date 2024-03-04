@@ -1,0 +1,12 @@
+numpy
+matplotlib
+scipy
+tqdm
+scienceplots
+numba
+simple-pytree
+flax
+optax
+bayex
+--find-links https://storage.googleapis.com/jax-releases/jax_releases.html
+jax[cuda12]
