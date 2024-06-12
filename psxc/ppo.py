@@ -57,14 +57,25 @@ class CellEnv(Pytree):
 
     observation_space: int = 1
 
-    def __init__(self, env_params, n_envs, x0=50, dt=0.1, t_max=50.0, max_steps=10):
+    def __init__(self, env_params, n_envs, x0=50, dt=0.1, t_max=50.0, max_steps=10, penalty=0.5):
+        """Initialize the environment.
+        Args:
+            env_params: The parameters of the environment.
+            n_envs: Number of environments to run in parallel.
+            x0: Initial position of the cell.
+            dt: Time step for the simulation.
+            t_max: Maximum time for a splitting event.
+            max_steps: Maximum number of steps before the environment is done.
+            penalty: Penalty for the time regularization term.
+        """
         self.env_params = env_params
         self.n_envs = n_envs
         self.x0 = x0
         self.max_steps = max_steps - 2
         self.length = 1.0
-        self.t_max = 30.0
+        self.t_max = t_max
         self.dt = dt
+        self.penalty = penalty
 
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, key):
@@ -74,10 +85,9 @@ class CellEnv(Pytree):
         keys = jax.random.split(key_init, self.n_envs)
 
         def init_env_state(key, x, x0):
+            """Initialize the environment state."""
             cell_state = psxc.CellState.spawn(key, x=x, length=1.0)
             key_grad, key_val = jax.random.split(key)
-            # grad = jax.random.choice(key_grad, jnp.array([0.01, 0.02, 0.05, 0.08, 0.1, 0.25, 0.75, 1.0]))
-            # value = jax.random.choice(key_val, jnp.array([25.0, 75.0, 125.0, 175.0]))
             grad = 10 ** jax.random.uniform(key_grad, (), minval=-3, maxval=0.4)
             value = jax.random.uniform(key_val, (), minval=25.0, maxval=175.0)
             profile = psxc.LinearProfile(grad, value, x=x0)
@@ -89,32 +99,43 @@ class CellEnv(Pytree):
 
     @partial(jax.jit, static_argnums=(0,))
     def step(self, key, env_states, actions):
+        """Step the environment forward given the actions."""
+
         def _step(env_state, action):
             cell_state = env_state.cell_state
+
+            # Perform the sensing event and get the new state.
+            # The action is the signal strength for each of the pseudopods.
             _, xf, T = psxc.sensing_event(self.env_params, key, cell_state, env_state.profile, action, t_max=self.t_max, dt=self.dt)
             obs = self._get_obs(cell_state, env_state.profile)
-            reward = (xf[0] - cell_state.xf[0]) / self.length  + 0.0 * (self.t_max-T)/self.t_max # Gain on the direction of the gradient
-            reward = jnp.where(env_state.step <= 2, 0.0, reward)
+
+            # Compute the reward as the orientation reward and a time regularization term.
+            # Only start computing the reward after the first step.
+            orientation_reward = (xf[0] - cell_state.xf[0]) / self.length
+            time_regularization = self.penalty * (self.t_max - T) / self.t_max
+            reward = jnp.where(env_state.step <= 2, 0.0, orientation_reward + time_regularization)
+
+            # Update the cell state and the environment state.
             cell_state = cell_state.replace(xf=xf, xu=cell_state.xf, age=cell_state.age + T)
             done = env_state.step >= self.max_steps
             env_state = EnvState(cell_state, env_state.step + 1, env_state.profile, env_state.x0, done)
             return obs, env_state, reward, done, {}
 
         def _do_nothing(env_state, _):
-            # env_state_re = jax.tree.map(lambda x: x*0, env_state)
+            # Do nothing if the environment is done.
             obs_re = jnp.array([0.0])
             return obs_re, env_state, 0.0, True, {}
 
         @jax.vmap
         def step(env_state, action):
-            #action = jnp.zeros(12).at[jnp.array([0, 1, 2, 10, 11])].set(1.0)
-            #action = jnp.ones(12)
             return jax.lax.cond(env_state.done, _do_nothing, _step, env_state, action)
 
         actions = jnp.clip(actions, 0.0, 1.0)
         return step(env_states, actions)
 
     def _get_obs(self, cell_state, profile):
+        """Get the observation of the environment."""
+        # The observation is the log10 of the signal to noise ratio.
         snr = profile.logsnr(cell_state.xf)
         return jnp.array([snr])
 
@@ -139,13 +160,12 @@ class ActorCritic(nn.Module):
         for _ in range(4):
             x_a = nn.tanh(nn.Dense(128, kernel_init=init_fn_actor)(x_a))
 
-        if self.discrete:  # Discrete actin space (0 or 1)
-            # Output the logits of the action probabiilites. There are 12 values that can be either 1 or 0.
+        if self.discrete:  # Discrete actin space [0 or 1]^n
             logits = nn.Dense(self.outdim * 2)(x_a)
             logits = logits.reshape((*logits.shape[:-1], self.outdim, 2))
             return value, logits
 
-        # Continuous action space
+        # Continuous action space (0, 1)^n
         mu = nn.sigmoid(nn.Dense(self.outdim, kernel_init=init_fn)(x_a))
         log_scale = nn.Dense(self.outdim, kernel_init=init_fn)(x_a)
         scale = jax.lax.clamp(0.05, jax.nn.softplus(-0.5 + log_scale), 0.5)
@@ -192,11 +212,14 @@ def loss_fn(params, apply_fn, minibatch, eps=0.1, entropy_coeff=1e-6, vf_coeff=0
 
 @partial(jax.jit, static_argnums=(3,))
 def train_step(key, train_state, batch, config):
+    """Perform a training step with the PPO algorithm."""
 
     buffer_size = batch[0].shape[1]
     grad_fn = jax.grad(loss_fn, has_aux=True)
 
     def epoch_step(state, key):
+        """Perform n_minibatch*n_epochs gradient descent steps."""
+
         def batch_step(state, chosen):
             minibatch = jax.tree.map(lambda x: x[:, chosen], batch)
             grads, metrics = grad_fn(state.params, state.apply_fn, minibatch, discrete=config.discrete)
@@ -214,6 +237,8 @@ def train_step(key, train_state, batch, config):
 
 
 def calculate_gae(values, rewards, dones, discount=0.99, A_lambda=0.95):
+    """Calculate the Generalized Advantage Estimation."""
+
     def body_fn(A, x):
         next_value, done, value, reward = x
         value_diff = discount * next_value * (1 - done) - value
@@ -230,6 +255,7 @@ def calculate_gae(values, rewards, dones, discount=0.99, A_lambda=0.95):
 
 @jax.jit
 def collect_batch(buffer, discount=1.0, A_lambda=0.95):
+    """Collect the batch from the buffer and compute the GAE."""
     gae = calculate_gae(buffer.values, buffer.rewards, buffer.dones, discount, A_lambda)
     target = gae + buffer.values
     batch = (buffer.states, buffer.actions, buffer.log_probs, target, gae, buffer.mask)
@@ -242,6 +268,7 @@ def collect_batch(buffer, discount=1.0, A_lambda=0.95):
 
 
 def init_train_state(key, env, config):
+    """Initialize the training state with the model and the optimizer."""
     model = ActorCritic(12, discrete=config.discrete)
     dummy_x = jnp.ones((1, 1, env.observation_space))
     params = model.init(key, dummy_x)
@@ -252,6 +279,7 @@ def init_train_state(key, env, config):
 
 @partial(jax.jit, static_argnums=(2, 3))
 def evaluate(state, env_params, config, deterministic=False):
+    """Deterministic evaluation of the policy."""
     eval_envs = CellEnv(env_params, config.n_eval_envs, config.dt, max_steps=config.n_steps)
     eval_key = jax.random.key(42)
 
@@ -273,12 +301,12 @@ def evaluate(state, env_params, config, deterministic=False):
     keys = jax.random.split(eval_key, config.n_steps)
     _, (rewards, dones) = jax.lax.scan(transition_step, (obs, env_state), keys)
 
-    masks = 1 - dones
-    reward = jnp.sum(rewards * masks, axis=0)
+    reward = jnp.sum(rewards * (1 - dones), axis=0)
     return jnp.mean(reward)
 
 
 def train_loop(key, config, env_params, checkpointer):
+    """Main training loop for the PPO algorithm."""
 
     envs = CellEnv(env_params, config.n_train_envs, config.dt, max_steps=config.n_steps)
 
@@ -287,6 +315,8 @@ def train_loop(key, config, env_params, checkpointer):
 
     @jax.jit
     def run_episodes(train_state, key):
+        """Run n_steps in parallel for each of the num_train_envs."""
+
         def step(carry, key):
             train_state, obs, env_state, mask = carry
             key_action, key_step = jax.random.split(key, 2)
@@ -303,12 +333,14 @@ def train_loop(key, config, env_params, checkpointer):
                 actions = jax.random.normal(key_action, shape=mu.shape) * scale + mu
                 log_prob = jax.scipy.stats.norm.logpdf(actions, mu, scale).sum(-1)
 
+            # Step the environment and collect the rollout.
             next_obs, next_env_state, reward, done, _ = envs.step(key_step, env_state, actions)
             rollout = Rollout(obs, actions, reward, done, log_prob, value[..., 0], 1 - mask)
+
             return (train_state, next_obs, next_env_state, mask | done), rollout
 
         key, key_reset = jax.random.split(key, 2)
-        keys = jax.random.split(key, config.n_steps+1)
+        keys = jax.random.split(key, config.n_steps + 1)
 
         obs, env_state = envs.reset(key_reset)
         mask = jnp.zeros(config.n_train_envs) > 1
@@ -332,39 +364,19 @@ def train_loop(key, config, env_params, checkpointer):
         key_train = jax.random.fold_in(key, step)
         batch = collect_batch(buffer, config.discount, config.gae_lambda)
         train_state, metrics = train_step(key_train, train_state, batch, config)
-        metrics = jax.tree.map(jnp.mean, metrics)
 
-        logging_step = int(step * step_size)
-        checkpointer.writer.add_scalar("train/loss", metrics[0], logging_step)
-        checkpointer.writer.add_scalar("train/policy_loss", metrics[1], logging_step)
-        checkpointer.writer.add_scalar("train/critic_loss", metrics[2], logging_step)
-        checkpointer.writer.add_scalar("train/entropy_loss", metrics[3], logging_step)
-        checkpointer.writer.add_scalar("train/kl_divergence", metrics[4], logging_step)
+        # Logkeeping the metrics and saving the model.
+        checkpointer.writer.add_scalar("train/loss", metrics[0], pbar.n)
+        checkpointer.writer.add_scalar("train/policy_loss", metrics[1], pbar.n)
+        checkpointer.writer.add_scalar("train/critic_loss", metrics[2], pbar.n)
+        checkpointer.writer.add_scalar("train/entropy_loss", metrics[3], pbar.n)
+        checkpointer.writer.add_scalar("train/kl_divergence", metrics[4], pbar.n)
 
+        # Evaluate the model every eval_interval steps.
         if step % eval_interval == 0:
             eval_reward = evaluate(train_state, env_params, config, deterministic=False)
-            checkpointer.writer.add_scalar("eval/reward", eval_reward, logging_step)
-
-            pbar.set_description(f"R: {eval_reward:.2f}")
-
-            #            fake_input = jnp.arange(-7.0, 1.0, 1.0)[..., None]
-            #            fake_key = jax.random.key(0)
-            #            np.set_printoptions(precision=3)
-            #            if config.discrete:
-            #                _, logits = train_state.apply_fn(train_state.params, fake_input)
-            #                actions = jax.random.categorical(fake_key, logits, -1)
-            #                actions = jnp.argmax(jax.nn.softmax(logits), -1)
-            #                actions = jnp.clip(actions, 0, 1)
-            #                tqdm.write("Actions" + "\n" + str(jax.nn.softmax(logits, -1)[..., 1]), end="\n\n")
-            #            else:
-            #                _, (mu, scale) = train_state.apply_fn(train_state.params, fake_input)
-            #                actions = jax.random.normal(fake_key, shape=mu.shape) * scale + mu
-            #                actions = jnp.clip(actions, 0.0, 1.0)
-            #
-            #                # round to two digits
-            #                mu = jnp.round(mu, 2)
-            #                scale = jnp.round(scale, 2)
-            #                tqdm.write("Actions" + "\n" + str(mu) + "\n" + str(scale), end="\n\n")
+            checkpointer.writer.add_scalar("eval/reward", eval_reward, pbar.n)
+            pbar.set_description(f"R: {eval_reward:.2g}")
 
             checkpointer.manager.save(checkpointer.dir.absolute() / "checkpoint", train_state.params, force=True)
 
