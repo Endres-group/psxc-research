@@ -1,6 +1,10 @@
 # Pseudopod Competition as a decision-making mechanism
 **Code for the paper on pseudopod splitting during chemotaxis.**
 
+<p align="center">
+  <img src="https://github.com/Endres-group/psxc-research/assets/38870744/bff0ef0a-f034-4d4b-8d2d-08017eba73de" height="236" />
+</p>
+
 ## Project structure
 The project is structured as follows:
 
